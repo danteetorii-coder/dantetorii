@@ -28,11 +28,15 @@ def print_separator(char="─", width=60):
 
 def print_result(result):
     print_separator()
-    print(f"Ação: {result.action}")
+    print(f"Acao: {result.action}")
     print(f"Lead ID: {result.lead_id or 'N/A'}")
     print(f"Resumo: {result.summary}")
+    if result.alerts:
+        print("\nAlertas:")
+        for alert in result.alerts:
+            print(f"  ! {alert}")
     if result.next_steps:
-        print("\nPróximas ações:")
+        print("\nProximas acoes:")
         for i, step in enumerate(result.next_steps, 1):
             print(f"  {i}. {step}")
     print_separator()
@@ -133,68 +137,73 @@ def cmd_respond(args, orchestrator: LeadOrchestrator):
 
 
 def cmd_demo(args, orchestrator: LeadOrchestrator):
-    """Executa demonstração com leads simulados de diferentes canais."""
+    """Executa demonstração com leads realistas do nicho executivo PJ."""
     print("\n" + "=" * 60)
-    print("         DTS LEAD AGENT - MODO DEMO")
+    print("   DTS LEAD AGENT - DEMO: Executivos PJ + Familia")
     print("=" * 60)
 
+    # Cenario 1: Lead quente — saiu ha 20 dias, portabilidade disponivel, filhos pequenos
+    lead1 = WhatsAppChannel().format_for_agent(
+        WhatsAppMessage(
+            sender_name="Ricardo Alves",
+            sender_number="+55 11 98765-4321",
+            message_text=(
+                "Ola! Fui demitido da Accenture ha 3 semanas, era Gerente Senior de TI. "
+                "Abri minha consultoria (ja tenho CNPJ) e preciso de plano de saude urgente. "
+                "Tenho esposa e dois filhos de 4 e 7 anos. Todos precisam de cobertura. "
+                "Tinha plano Bradesco Saude nacional pela empresa. Quero manter o mesmo padrao."
+            ),
+        )
+    )
+
+    # Cenario 2: Lead morno — LinkedIn, executivo de financas, informacoes incompletas
+    lead2 = LinkedInChannel().format_for_agent(
+        LinkedInChannel().parse_lead_gen_form({
+            "firstName": "Fernanda",
+            "lastName": "Torres",
+            "title": "CFO",
+            "companyName": "FT Consultoria Financeira",
+            "emailAddress": "fernanda.torres@ftconsultoria.com.br",
+            "message": (
+                "Vi a campanha de voces. Abri minha empresa de consultoria financeira "
+                "ha 2 meses. Preciso de plano para mim e minha familia. "
+                "Trabalhei 8 anos no Itau onde tinhamos SulAmerica."
+            ),
+            "campaign": "DTS-Executivos-PJ-LinkedIn-Q2",
+        })
+    )
+
+    # Cenario 3: Formulario web — possivel fora do nicho (poucas informacoes de familia)
+    lead3 = WebFormChannel().format_for_agent(
+        WebFormSubmission(
+            name="Marcos Vinicius",
+            email="mv@mvengenharia.com.br",
+            phone="(31) 99988-7766",
+            company_name="MV Engenharia e Projetos ME",
+            message=(
+                "Quero plano de saude para minha empresa. "
+                "Sou engenheiro civil, abri meu escritorio sozinho."
+            ),
+            plan_interest="PME",
+            utm_source="google",
+            utm_campaign="plano-saude-pj-engenheiros",
+        )
+    )
+
     demo_leads = [
-        {
-            "channel": "whatsapp",
-            "data": WhatsAppChannel().format_for_agent(
-                WhatsAppMessage(
-                    sender_name="Carlos Mendes",
-                    sender_number="+55 11 99887-6543",
-                    message_text=(
-                        "Boa tarde! Vi o anúncio de vocês. "
-                        "Tenho uma empresa com 45 funcionários e preciso trocar o plano de saúde atual. "
-                        "A Unimed que temos está muito cara e o atendimento é ruim. "
-                        "Preciso de algo com cobertura nacional pois temos filiais. "
-                        "Podemos conversar?"
-                    ),
-                )
-            ),
-        },
-        {
-            "channel": "formulario_web",
-            "data": WebFormChannel().format_for_agent(
-                WebFormSubmission(
-                    name="Ana Paula Costa",
-                    email="ana.paula@empresa.com.br",
-                    phone="(21) 3344-5566",
-                    company_name="TechSolutions Ltda",
-                    num_employees=12,
-                    plan_interest="PME",
-                    message="Quero contratar plano empresarial para minha equipe. Somos startup de tecnologia.",
-                    utm_source="google",
-                    utm_campaign="plano-saude-pme-2024",
-                )
-            ),
-        },
-        {
-            "channel": "linkedin",
-            "data": LinkedInChannel().format_for_agent(
-                LinkedInChannel().parse_lead_gen_form({
-                    "firstName": "Roberto",
-                    "lastName": "Silva",
-                    "title": "Diretor de RH",
-                    "companyName": "Grupo Construções BR",
-                    "companySizeRange": "201-500",
-                    "emailAddress": "roberto.silva@grupocbr.com.br",
-                    "message": "Temos 280 funcionários e nosso contrato atual vence em 3 meses. Quero cotações.",
-                    "campaignName": "DTS-Empresarial-Q1",
-                })
-            ),
-        },
+        {"channel": "whatsapp",      "data": lead1, "label": "Lead QUENTE (portabilidade elegivel + filhos)"},
+        {"channel": "linkedin",      "data": lead2, "label": "Lead MORNO (informacoes incompletas)"},
+        {"channel": "formulario_web","data": lead3, "label": "Lead FRIO (possivel fora do nicho — 1 vida)"},
     ]
 
-    for i, lead_data in enumerate(demo_leads, 1):
-        print(f"\n[Demo {i}/{len(demo_leads)}] Canal: {lead_data['channel']}")
+    for i, item in enumerate(demo_leads, 1):
+        print(f"\n[Demo {i}/{len(demo_leads)}] {item['label']}")
+        print(f"Canal: {item['channel']}")
         print_separator("-")
-        result = orchestrator.ingest_lead(lead_data["data"], lead_data["channel"])
+        result = orchestrator.ingest_lead(item["data"], item["channel"])
         print_result(result)
 
-    print("\n--- Dashboard após demo ---")
+    print("\n--- Dashboard apos demo ---")
     cmd_dashboard(None, orchestrator)
 
 

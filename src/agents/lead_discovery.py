@@ -1,8 +1,6 @@
 """
-Agente de Descoberta de Leads (DTS)
-
-Responsável por identificar e registrar leads a partir de diferentes canais.
-Extrai informações iniciais e cria o registro no sistema.
+Agente de Descoberta de Leads — DTS
+Nicho: executivos ex-CLT que abriram PJ, precisam de plano para si + família (3+ vidas).
 """
 
 import json
@@ -10,30 +8,40 @@ from typing import Optional
 
 import anthropic
 
-from src.models.lead import Lead, LeadChannel, LeadStatus
+from src.models.lead import Lead, LeadChannel, LeadStatus, PlanType
 from src.storage.lead_repository import LeadRepository
 from src.tools.qualification_tools import DISCOVERY_TOOLS
 
-SYSTEM_PROMPT = """Você é o agente de descoberta de leads da DTS, uma corretora especializada em planos de saúde.
+SYSTEM_PROMPT = """Você é o agente de descoberta de leads da DTS, corretora especializada em planos de saúde para executivos que abriram sua própria empresa (PJ).
 
-Sua responsabilidade é:
-1. Receber dados brutos de novos contatos (mensagens, formulários, indicações)
-2. Extrair as informações relevantes disponíveis
-3. Criar o registro do lead no sistema usando as ferramentas disponíveis
-4. Classificar preliminarmente o tipo de plano de interesse
+PERFIL DO LEAD IDEAL:
+- Executivo (gerente, diretor, C-level, sócio) que saiu de uma empresa CLT
+- Abriu ou está abrindo seu próprio CNPJ
+- Precisa de plano de saúde para si + família (mínimo 3 pessoas: titular + cônjuge + filhos)
+- Perdeu o plano corporativo da empresa anterior
+- Busca manter o padrão de cobertura que tinha (nacional, apartamento)
 
-Contexto da DTS:
-- Trabalhamos com planos de saúde individuais, familiares, PME (2-99 vidas) e empresariais (100+ vidas)
-- Também oferecemos planos odontológicos
-- Operamos com as principais operadoras: Unimed, Bradesco Saúde, SulAmérica, Amil, Porto Seguro Saúde, Hapvida
+SINAIS DE ALERTA POSITIVOS (lead quente):
+- Menciona que "saiu da empresa", "abriu minha empresa", "me tornei PJ", "virei sócio"
+- Menciona cônjuge e/ou filhos precisando de cobertura
+- Faz referência ao plano que tinha antes (Bradesco, SulAmérica, Unimed, Amil, etc.)
+- Menciona urgência: "preciso logo", "estou sem plano", "minha filha precisa de pediatra"
+- Cargo anterior de nível gerencial ou superior
 
-Ao processar um novo contato:
-- Sempre crie o lead com as informações disponíveis
-- Não invente informações que não foram fornecidas
-- Se o canal for WhatsApp ou ligação, extraia o número de contato
-- Identifique se é pessoa física (PF) ou jurídica (PJ) quando possível
-- Seja objetivo e eficiente
+SINAIS DE ATENÇÃO (pode não se encaixar no nicho):
+- Apenas 1-2 pessoas (mínimo do produto é 3 vidas via PME)
+- Continua CLT (não é PJ ainda)
+- Menos de 2 anos de carreira profissional
 
+AO PROCESSAR UM CONTATO:
+1. Identifique nome, contato e canal
+2. Extraia cargo e empresa anterior, se mencionados
+3. Identifique se mencionou família / número de pessoas
+4. Verifique se houve menção a plano anterior e qual operadora
+5. Capture a data de saída da empresa se mencionada
+6. Crie o lead com todas as informações disponíveis
+
+NÃO invente informações. Crie o lead com o que houver disponível.
 Responda sempre em português brasileiro."""
 
 
@@ -54,23 +62,55 @@ class LeadDiscoveryAgent:
                 whatsapp=tool_input.get("whatsapp"),
                 company_name=tool_input.get("company_name"),
             )
-            if tool_input.get("plan_type"):
-                from src.models.lead import PlanType
-                try:
-                    lead.plan_type = PlanType(tool_input["plan_type"])
-                except ValueError:
-                    pass
+
+            # Campos específicos do nicho executivo PJ
+            for field in [
+                "former_company", "former_job_title", "left_company_date",
+                "has_cnpj", "num_family_members", "had_corporate_plan",
+                "previous_operator",
+            ]:
+                if tool_input.get(field) is not None:
+                    setattr(lead, field, tool_input[field])
+
+            # Sincroniza beneficiários com membros da família
+            if lead.num_family_members:
+                lead.num_beneficiaries = lead.num_family_members
+
+            # Define tipo de plano padrão do nicho
+            if lead.num_family_members and lead.num_family_members >= 3:
+                lead.plan_type = PlanType.PME_FAMILY
 
             if tool_input.get("raw_message"):
                 lead.raw_data["raw_message"] = tool_input["raw_message"]
                 lead.add_interaction(channel.value, tool_input["raw_message"], "inbound")
 
             self.repository.update(lead)
-            return json.dumps({"success": True, "lead_id": lead.id, "lead_name": lead.name})
+
+            return json.dumps({
+                "success": True,
+                "lead_id": lead.id,
+                "lead_name": lead.name,
+                "num_family_members": lead.num_family_members,
+                "is_minimum_viable": lead.is_minimum_viable(),
+                "alert": (
+                    "ATENÇÃO: menos de 3 vidas informadas. Verificar se é o nicho correto."
+                    if lead.num_family_members and lead.num_family_members < 3
+                    else None
+                ),
+            })
 
         if tool_name == "listar_leads_novos":
             leads = self.repository.list_by_status(LeadStatus.NEW)
-            return json.dumps([{"id": l.id, "name": l.name, "channel": l.channel.value} for l in leads])
+            return json.dumps([
+                {
+                    "id": l.id,
+                    "name": l.name,
+                    "channel": l.channel.value,
+                    "num_family_members": l.num_family_members,
+                    "former_job_title": l.former_job_title,
+                }
+                for l in leads
+            ])
 
         if tool_name == "obter_estatisticas":
             return json.dumps(self.repository.get_stats())
@@ -78,19 +118,9 @@ class LeadDiscoveryAgent:
         return json.dumps({"error": f"Ferramenta '{tool_name}' não reconhecida"})
 
     def process_new_contact(self, raw_input: str, channel_hint: Optional[str] = None) -> dict:
-        """
-        Processa um novo contato bruto e cria o lead no sistema.
-
-        Args:
-            raw_input: Texto bruto com informações do contato (mensagem, formulário, etc.)
-            channel_hint: Dica sobre o canal de origem (opcional)
-
-        Returns:
-            Dict com dados do lead criado
-        """
         user_message = f"Novo contato recebido:\n\n{raw_input}"
         if channel_hint:
-            user_message += f"\n\nCanal de origem: {channel_hint}"
+            user_message += f"\n\nCanal: {channel_hint}"
 
         messages = [{"role": "user", "content": user_message}]
 
@@ -104,10 +134,9 @@ class LeadDiscoveryAgent:
             )
 
             if response.stop_reason == "end_turn":
-                # Extrai texto da resposta
                 text = next(
                     (block.text for block in response.content if hasattr(block, "text")),
-                    "Lead processado com sucesso.",
+                    "Lead processado.",
                 )
                 return {"status": "success", "message": text}
 
@@ -121,19 +150,17 @@ class LeadDiscoveryAgent:
                             "tool_use_id": block.id,
                             "content": result,
                         })
-
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
             else:
                 break
 
-        return {"status": "error", "message": "Resposta inesperada do agente"}
+        return {"status": "error", "message": "Resposta inesperada"}
 
     def get_summary(self) -> str:
-        """Retorna um resumo dos leads no sistema."""
         stats = self.repository.get_stats()
         lines = [
-            "=== Resumo de Leads - DTS ===",
+            "=== Leads DTS — Executivos PJ ===",
             f"Total: {stats['total']}",
             "\nPor status:",
         ]

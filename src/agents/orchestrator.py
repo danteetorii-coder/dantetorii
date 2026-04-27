@@ -1,43 +1,16 @@
 """
-Orquestrador Principal - DTS Lead Agent
-
-Coordena o fluxo completo de captação e qualificação de leads:
-  Canal → Descoberta → Qualificação → Notificação ao corretor
-
-Usa o padrão de agentes da Anthropic SDK para orquestrar
-os subagentes de descoberta e qualificação.
+Orquestrador Principal — DTS Lead Agent
+Nicho: executivos ex-CLT que abriram PJ, precisam de plano para si + família (3+ vidas).
 """
 
-import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Optional
-
-import anthropic
 
 from src.agents.lead_discovery import LeadDiscoveryAgent
 from src.agents.lead_qualifier import LeadQualifierAgent
-from src.models.lead import LeadStatus
+from src.models.lead import Lead, LeadStatus, PortabilityStatus
 from src.storage.lead_repository import LeadRepository
-
-
-ORCHESTRATOR_SYSTEM_PROMPT = """Você é o orquestrador do sistema de leads da DTS (corretora de planos de saúde).
-
-Você coordena dois subagentes:
-1. **Agente de Descoberta**: captura e registra novos leads de qualquer canal
-2. **Agente de Qualificação**: avalia e pontua leads usando critérios BANT
-
-Seu papel é:
-- Entender a solicitação do usuário (corretor/gestor da DTS)
-- Acionar o agente correto para a tarefa
-- Apresentar resultados de forma clara e acionável
-- Priorizar leads qualificados para o corretor
-
-Métricas que você monitora:
-- Taxa de conversão por canal
-- Tempo médio de qualificação
-- Leads qualificados aguardando atendimento
-
-Responda sempre em português brasileiro, de forma profissional e objetiva."""
 
 
 @dataclass
@@ -46,7 +19,8 @@ class OrchestratorResult:
     lead_id: Optional[str]
     summary: str
     next_steps: list[str]
-    data: dict
+    alerts: list[str] = field(default_factory=list)   # alertas de urgência
+    data: dict = field(default_factory=dict)
 
 
 class LeadOrchestrator:
@@ -54,22 +28,13 @@ class LeadOrchestrator:
         self.repository = LeadRepository(storage_path)
         self.discovery_agent = LeadDiscoveryAgent(self.repository, model)
         self.qualifier_agent = LeadQualifierAgent(self.repository, model)
-        self.client = anthropic.Anthropic()
-        self.model = model
 
-    # ── Canal: entrada de novo lead ──────────────────────────────────────────
+    # ── Fluxo principal ──────────────────────────────────────────────────────
 
     def ingest_lead(self, raw_input: str, channel: str = "manual") -> OrchestratorResult:
-        """
-        Fluxo completo para um novo lead:
-        1. Descoberta e registro
-        2. Qualificação imediata
-        3. Retorna resultado consolidado
-        """
-        # 1. Descoberta
+        """Descobre, registra e qualifica imediatamente um novo lead."""
         discovery_result = self.discovery_agent.process_new_contact(raw_input, channel)
 
-        # Pega o lead mais recente criado
         all_leads = self.repository.list_all()
         if not all_leads:
             return OrchestratorResult(
@@ -77,28 +42,26 @@ class LeadOrchestrator:
                 lead_id=None,
                 summary="Não foi possível criar o lead.",
                 next_steps=["Verifique os dados e tente novamente"],
-                data=discovery_result,
             )
 
-        # Lead mais recente
-        latest_lead = sorted(all_leads, key=lambda l: l.created_at, reverse=True)[0]
-        lead_id = latest_lead.id
+        lead = sorted(all_leads, key=lambda l: l.created_at, reverse=True)[0]
+        lead_id = lead.id
 
-        # 2. Qualificação
         qual_result = self.qualifier_agent.qualify_lead(lead_id)
 
-        # 3. Determina próximas ações
         lead = self.repository.get(lead_id)
+        alerts = self._build_alerts(lead)
         next_steps = self._get_next_steps(lead)
 
         return OrchestratorResult(
             action="lead_ingested_and_qualified",
             lead_id=lead_id,
             summary=(
-                f"Lead '{lead.name}' registrado (canal: {lead.channel.value}) | "
+                f"Lead '{lead.name}' registrado | "
                 f"Score: {lead.score}/100 | Status: {lead.status.value}"
             ),
             next_steps=next_steps,
+            alerts=alerts,
             data={"discovery": discovery_result, "qualification": qual_result},
         )
 
@@ -109,11 +72,8 @@ class LeadOrchestrator:
 
         if not lead:
             return OrchestratorResult(
-                action="error",
-                lead_id=lead_id,
-                summary="Lead não encontrado",
-                next_steps=[],
-                data={},
+                action="error", lead_id=lead_id,
+                summary="Lead não encontrado", next_steps=[],
             )
 
         return OrchestratorResult(
@@ -121,98 +81,170 @@ class LeadOrchestrator:
             lead_id=lead_id,
             summary=(
                 f"Resposta de '{lead.name}' processada | "
-                f"Score atualizado: {lead.score}/100 | Status: {lead.status.value}"
+                f"Score: {lead.score}/100 | Status: {lead.status.value}"
             ),
             next_steps=self._get_next_steps(lead),
+            alerts=self._build_alerts(lead),
             data=qual_result,
         )
 
     def qualify_pending(self) -> list[OrchestratorResult]:
-        """Qualifica todos os leads pendentes (status = novo)."""
+        """Qualifica todos os leads com status 'novo'."""
         results = self.qualifier_agent.qualify_all_new()
-        orchestrator_results = []
-
-        for result in results:
-            lead_id = result.get("lead_id")
-            lead = self.repository.get(lead_id) if lead_id else None
-            orchestrator_results.append(
-                OrchestratorResult(
-                    action="batch_qualification",
-                    lead_id=lead_id,
-                    summary=result.get("summary", ""),
-                    next_steps=self._get_next_steps(lead) if lead else [],
-                    data=result,
-                )
+        return [
+            OrchestratorResult(
+                action="batch_qualification",
+                lead_id=r.get("lead_id"),
+                summary=r.get("summary", ""),
+                next_steps=self._get_next_steps(self.repository.get(r.get("lead_id"))),
+                alerts=self._build_alerts(self.repository.get(r.get("lead_id"))),
+                data=r,
             )
+            for r in results
+        ]
 
-        return orchestrator_results
+    # ── Consultas ────────────────────────────────────────────────────────────
 
     def get_qualified_leads(self) -> list[dict]:
-        """Retorna leads qualificados aguardando atendimento do corretor."""
+        """Leads qualificados priorizados por score e urgência de portabilidade."""
         leads = self.repository.list_by_status(LeadStatus.QUALIFIED)
-        return [
-            {
+
+        def priority_key(l: Lead):
+            portability_bonus = 20 if l.portability_status == PortabilityStatus.ELIGIBLE else 0
+            children_bonus = 10 if l.has_children_under_12 else 0
+            return l.score + portability_bonus + children_bonus
+
+        leads.sort(key=priority_key, reverse=True)
+
+        result = []
+        for l in leads:
+            days = l.days_since_leaving_company()
+            portability_info = None
+            if l.portability_status == PortabilityStatus.ELIGIBLE and days is not None:
+                remaining = 60 - days
+                portability_info = f"PORTABILIDADE: {remaining} dias restantes"
+
+            result.append({
                 "id": l.id,
                 "name": l.name,
                 "score": l.score,
-                "plan_type": l.plan_type.value,
-                "channel": l.channel.value,
+                "score_breakdown": l.score_breakdown,
+                "former_job_title": l.former_job_title,
+                "former_company": l.former_company,
                 "company_name": l.company_name,
-                "num_beneficiaries": l.num_beneficiaries,
+                "family_composition": l.family_composition,
+                "num_family_members": l.num_family_members,
+                "previous_operator": l.previous_operator,
+                "previous_plan_coverage": l.previous_plan_coverage,
                 "budget_range": l.budget_range,
-                "decision_timeline": l.decision_timeline,
-                "pain_points": l.pain_points,
-                "contact": l.phone or l.whatsapp or l.email,
+                "urgency_level": l.urgency_level,
+                "portability_info": portability_info,
+                "has_children_under_12": l.has_children_under_12,
+                "contact": l.whatsapp or l.phone or l.email,
+                "channel": l.channel.value,
                 "notes": l.qualification_notes,
-            }
-            for l in sorted(leads, key=lambda x: x.score, reverse=True)
-        ]
+            })
+        return result
 
     def get_dashboard(self) -> dict:
-        """Retorna visão consolidada para o corretor/gestor."""
         stats = self.repository.get_stats()
         qualified = self.get_qualified_leads()
         qualifying = self.repository.list_by_status(LeadStatus.QUALIFYING)
+
+        # Leads com portabilidade em prazo (alertas críticos)
+        portability_alerts = [
+            l for l in self.repository.list_all()
+            if l.portability_status == PortabilityStatus.ELIGIBLE
+            and l.status not in (LeadStatus.CONVERTED, LeadStatus.LOST)
+        ]
 
         return {
             "stats": stats,
             "qualified_leads": qualified,
             "qualifying_count": len(qualifying),
+            "portability_alerts": len(portability_alerts),
             "top_channels": self._get_top_channels(stats),
         }
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _get_next_steps(self, lead) -> list[str]:
+    def _build_alerts(self, lead: Optional[Lead]) -> list[str]:
+        if not lead:
+            return []
+        alerts = []
+
+        # Alerta de portabilidade
+        if lead.portability_status == PortabilityStatus.ELIGIBLE:
+            days = lead.days_since_leaving_company()
+            if days is not None:
+                remaining = 60 - days
+                if remaining <= 15:
+                    alerts.append(f"CRITICO: portabilidade vence em {remaining} dias!")
+                else:
+                    alerts.append(f"URGENTE: portabilidade disponivel por mais {remaining} dias")
+
+        # Alerta de filhos pequenos sem plano
+        if lead.has_children_under_12 and lead.status in (LeadStatus.NEW, LeadStatus.QUALIFYING):
+            alerts.append("Filhos menores de 12 anos sem cobertura — urgência alta")
+
+        # Alerta de mínimo de vidas
+        if lead.num_family_members and lead.num_family_members < 3:
+            alerts.append(
+                f"Apenas {lead.num_family_members} vida(s) — mínimo do produto é 3. "
+                "Verificar se há mais membros ou requalificar."
+            )
+
+        return alerts
+
+    def _get_next_steps(self, lead: Optional[Lead]) -> list[str]:
         if not lead:
             return []
 
         if lead.status == LeadStatus.QUALIFIED:
-            contact = lead.phone or lead.whatsapp or lead.email or "sem contato registrado"
-            return [
-                f"Entrar em contato com {lead.name} ({contact})",
-                "Apresentar proposta personalizada",
-                "Agendar reunião de consultoria",
-            ]
+            contact = lead.whatsapp or lead.phone or lead.email or "sem contato"
+            steps = [f"Ligar / WhatsApp para {lead.name} ({contact})"]
+
+            if lead.portability_status == PortabilityStatus.ELIGIBLE:
+                days = lead.days_since_leaving_company()
+                remaining = 60 - days if days else "?"
+                steps.append(
+                    f"Usar portabilidade como argumento de urgência ({remaining} dias restantes)"
+                )
+
+            if lead.previous_operator:
+                steps.append(
+                    f"Preparar comparativo com o plano anterior ({lead.previous_operator})"
+                )
+
+            steps.append("Enviar proposta PME Familiar com 3+ operadoras para comparação")
+
+            if lead.has_children_under_12:
+                steps.append("Destacar cobertura pediátrica e pronto-socorro na proposta")
+
+            return steps
 
         if lead.status == LeadStatus.QUALIFYING:
             missing = []
-            if not lead.budget_range:
-                missing.append("orçamento disponível")
-            if lead.is_decision_maker is None:
-                missing.append("confirmação de autoridade decisória")
-            if not lead.decision_timeline:
-                missing.append("prazo para contratação")
-            if not lead.num_beneficiaries:
-                missing.append("número de beneficiários")
+            if not lead.num_family_members:
+                missing.append("número de pessoas no plano (familiar)")
+            if lead.had_corporate_plan is None:
+                missing.append("se tinha plano pela empresa anterior")
+            if not lead.left_company_date and lead.had_corporate_plan:
+                missing.append("data de saída da empresa (para checar portabilidade)")
+            if not lead.has_cnpj:
+                missing.append("se já tem CNPJ aberto")
 
-            actions = [f"Enviar mensagem de qualificação via {lead.channel.value}"]
+            steps = [f"Enviar mensagem de qualificação via {lead.channel.value}"]
             if missing:
-                actions.append(f"Coletar: {', '.join(missing)}")
-            return actions
+                steps.append(f"Coletar: {', '.join(missing)}")
+            return steps
 
         if lead.status == LeadStatus.DISQUALIFIED:
-            return ["Arquivar lead", "Agendar follow-up em 6 meses para reativação"]
+            reason = lead.raw_data.get("disqualification_reason", "critérios não atendidos")
+            return [
+                f"Arquivar: {reason}",
+                "Nutrir com conteúdo sobre planos individuais (caso mude de contexto)",
+            ]
 
         return ["Processar lead"]
 
